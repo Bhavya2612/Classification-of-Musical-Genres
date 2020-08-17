@@ -137,4 +137,225 @@ TRACKS_PATH = "fma_metadata/tracks.csv"
 subset = 'small'
 
 small_tracks_genre = track_genre_information(GENRE_PATH, TRACKS_PATH, subset)
+nb_songs = len(tf.io.gfile.glob(GCS_PATTERN))
+shard_size = math.ceil(1.0 * nb_songs / SHARDS)
+print("Pattern matches {} songs which will be rewritten as {} .tfrec files containing {} songs each.".format(nb_songs, SHARDS, shard_size))
+
+# functions to create the dataset from raw audio
+# define a function to get the label associated with a file path
+def get_label(file_path, genre_df=small_tracks_genre):
+    path = file_path.numpy()
+    path = path.decode("utf-8")
+    track_id = int(path.split('/')[-1].split('.')[0].lstrip('0'))
+    label = genre_df.loc[genre_df.track_id == track_id,'genre_nb'].values[0]
+    return tf.constant([label])
+
+# define a function that extracts the desired features from a file path
+def get_audio(file_path, window_size=window_size):
+    wav = tf.io.read_file(file_path)
+    audio = tf.audio.decode_wav(wav, desired_channels=1).audio
+    filtered_audio = audio[:window_size,:]
+
+    return filtered_audio
+
+# process the path
+def process_path(file_path, window_size=window_size):
+    label = get_label(file_path)
+    audio = get_audio(file_path, window_size)
+
+    return audio, label
+
+# parser, wrap around the processing function and specify output shape
+def parser(file_path, window_size=window_size):
+    audio, label = tf.py_function(process_path, [file_path], (tf.float32, tf.int32))
+    audio.set_shape((window_size,1))
+    label.set_shape((1,))
+
+    return audio, label
+
+filenames = tf.data.Dataset.list_files(GCS_PATTERN, seed=35155) # This also shuffles the images
+dataset_1d = filenames.map(parser, num_parallel_calls=AUTO)
+dataset_1d = dataset_1d.batch(shard_size)
+
+def _bytestring_feature(list_of_bytestrings):
+  return tf.train.Feature(bytes_list=tf.train.BytesList(value=list_of_bytestrings))
+
+def _int_feature(list_of_ints): # int64
+  return tf.train.Feature(int64_list=tf.train.Int64List(value=list_of_ints))
+
+def _float_feature(list_of_floats): # float32
+  return tf.train.Feature(float_list=tf.train.FloatList(value=list_of_floats))
+
+# writer function
+def to_tfrecord(tfrec_filewriter, song, label):  
+  one_hot_class = np.eye(N_CLASSES)[label][0]
+  feature = {
+      "song": _float_feature(song.flatten().tolist()), # one song in the list
+      "class": _int_feature([label]),        # one class in the list
+      "one_hot_class": _float_feature(one_hot_class.tolist()) # variable length  list of floats, n=len(CLASSES)
+  }
+  return tf.train.Example(features=tf.train.Features(feature=feature))
+
+def write_tfrecord(dataset, GCS_OUTPUT):
+  print("Writing TFRecords")
+  for shard, (song, label) in enumerate(dataset):
+    # batch size used as shard size here
+    shard_size = song.numpy().shape[0]
+    # good practice to have the number of records in the filename
+    filename = GCS_OUTPUT + "{:02d}-{}.tfrec".format(shard, shard_size)
+    
+    with tf.io.TFRecordWriter(filename) as out_file:
+      for i in range(shard_size):
+        example = to_tfrecord(out_file,
+                              song.numpy()[i],
+                              label.numpy()[i])
+        out_file.write(example.SerializeToString())
+      print("Wrote file {} containing {} records".format(filename, shard_size))
+ def read_tfrecord_1d(example):
+    features = {
+        "song": tf.io.FixedLenFeature([window_size], tf.float32), # tf.string means bytestring
+        "class": tf.io.FixedLenFeature([1], tf.int64),  # shape [] means scalar
+        "one_hot_class": tf.io.VarLenFeature(tf.float32),
+    }
+    example = tf.io.parse_single_example(example, features)
+    song = example['song']
+    # song = tf.audio.decode_wav(example['song'], desired_channels=1).audio
+    song = tf.cast(example['song'], tf.float32)
+    song = tf.reshape(song, [window_size, 1])
+    label = tf.reshape(example['class'], [1])
+    one_hot_class = tf.sparse.to_dense(example['one_hot_class'])
+    one_hot_class = tf.reshape(one_hot_class, [N_CLASSES])
+    return song, one_hot_class
+
+# function to load the dataset from TFRecords
+def load_dataset_1d(filenames):
+  # read from TFRecords. For optimal performance, read from multiple
+  # TFRecord files at once and set the option experimental_deterministic = False
+  # to allow order-altering optimizations.
+
+  option_no_order = tf.data.Options()
+  option_no_order.experimental_deterministic = False
+
+  dataset = tf.data.TFRecordDataset(filenames, num_parallel_reads=AUTO)
+  dataset = dataset.with_options(option_no_order)
+  dataset = dataset.map(read_tfrecord_1d, num_parallel_calls=AUTO)
+  # ignore potentially corrupted records
+  dataset = dataset.apply(tf.data.experimental.ignore_errors())
+  return dataset
+def create_train_validation_testing_sets(TFREC_PATTERN, 
+                                         VALIDATION_SPLIT=0.2,
+                                         TESTING_SPLIT=0.2):
+  
+  """
+  TFREC_PATTERN: string pattern for the TFREC bucket on GCS
+  """
+  
+  # see which accelerator is available
+  try: # detect TPUs
+    tpu = None
+    tpu = tf.distribute.cluster_resolver.TPUClusterResolver() # TPU detection
+    tf.config.experimental_connect_to_cluster(tpu)
+    tf.tpu.experimental.initialize_tpu_system(tpu)
+    strategy = tf.distribute.experimental.TPUStrategy(tpu)
+  except ValueError: # detect GPUs
+    strategy = tf.distribute.MirroredStrategy() # for GPU or multi-GPU machines
+
+  print("Number of accelerators: ", strategy.num_replicas_in_sync)
+
+  # Configuration
+  # adapted from https://codelabs.developers.google.com/codelabs/keras-flowers-data/#4
+  if tpu:
+    BATCH_SIZE = 16*strategy.num_replicas_in_sync  # A TPU has 8 cores so this will be 128
+  else:
+    BATCH_SIZE = 32  # On Colab/GPU, a higher batch size does not help and sometimes does not fit on the GPU (OOM)
+
+  # splitting data files between training and validation
+  filenames = tf.io.gfile.glob(TFREC_PATTERN)
+  testing_split = int(len(filenames) * TESTING_SPLIT)
+  training_filenames = filenames[testing_split:]
+  testing_filenames = filenames[:testing_split]
+  validation_split = int(len(filenames) * VALIDATION_SPLIT)
+  validation_filenames = training_filenames[:validation_split]
+  training_filenames = training_filenames[validation_split:]
+  validation_steps = int(3670 // len(filenames) * len(validation_filenames)) // BATCH_SIZE
+  steps_per_epoch = int(3670 // len(filenames) * len(training_filenames)) // BATCH_SIZE
+
+  return tpu, BATCH_SIZE, strategy, training_filenames, validation_filenames, testing_filenames, steps_per_epoch
+
+# get the batched dataset, optimizing for I/O performance
+# follow best practice for shuffling and repeating data
+def get_batched_dataset(filenames, load_func, train=False):
+  """
+  filenames: filenames to load
+  load_func: specific loading function to use
+  train: Boolean, whether this is a training set
+  """
+  dataset = load_func(filenames)
+  dataset = dataset.cache() # This dataset fits in RAM
+  if train:
+    # Best practices for Keras:
+    # Training dataset: repeat then batch
+    # Evaluation dataset: do not repeat
+    dataset = dataset.repeat()
+  dataset = dataset.batch(BATCH_SIZE)
+  dataset = dataset.prefetch(AUTO) # prefetch next batch while training (autotune prefetch buffer size)
+  # should shuffle too but this dataset was well shuffled on disk already
+  return dataset
+  # source: Dataset performance guide: https://www.tensorflow.org/guide/performance/datasets
+
+# instantiate the datasets
+training_dataset_1d = get_batched_dataset(training_filenames_1d, load_dataset_1d,
+                                          train=True)
+validation_dataset_1d = get_batched_dataset(validation_filenames_1d, load_dataset_1d,
+                                               train=False)
+testing_dataset_1d = get_batched_dataset(testing_filenames_1d, load_dataset_1d,
+                                            train=False)
+# create a CNN model
+with strategy.scope():
+  # create the model
+  model = tf.keras.Sequential([
+                              tf.keras.layers.Conv1D(filters=128,
+                                                      kernel_size=3,
+                                                      activation='relu',
+                                                      input_shape=[window_size,1],
+                                                      name = 'conv1'),
+                              
+                              tf.keras.layers.MaxPooling1D(name='max1'),
+
+                              tf.keras.layers.Conv1D(filters=64,
+                                                      kernel_size=3,
+                                                      activation='relu',
+                                                      name='conv2'),
+                              
+                              tf.keras.layers.MaxPooling1D(name='max2'),   
+
+                              tf.keras.layers.Flatten(name='flatten'),
+                                
+                              tf.keras.layers.Dense(100, activation='relu', name='dense1'),
+                              tf.keras.layers.Dropout(0.5, name='dropout2'),
+                              tf.keras.layers.Dense(20, activation='relu', name='dense2'),
+                              tf.keras.layers.Dropout(0.5, name='dropout3'),
+                              tf.keras.layers.Dense(8, name='dense3')                  
+  ])
+
+  #compile
+  model.compile(optimizer='adam',
+                loss=tf.keras.losses.CategoricalCrossentropy(from_logits=True),
+                metrics=['accuracy'])
+
+  model.summary()
+  
+ # train the model
+logdir = "logs/scalars/" + datetime.now().strftime("%Y%m%d-%H%M%S")
+tensorboard_callback = keras.callbacks.TensorBoard(log_dir=logdir)
+EPOCHS = 100
+raw_audio_history = model.fit(training_dataset_1d, steps_per_epoch=steps_per_epoch, 
+                    validation_data=validation_dataset_1d, epochs=EPOCHS,
+                    callbacks=tensorboard_callback)
+
+# evaluate on the test data
+model.evaluate(testing_dataset_1d)
+
+
+
 
